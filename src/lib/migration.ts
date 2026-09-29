@@ -6,13 +6,15 @@
 //   2. 模块纯只读：不修改规划与任何登记状态，CSV / 规划 / 登记变化后由调用方重新执行即可实时重算；
 //   3. 以「旧地址占用关系」建立依赖：设备 X 的目标地址当前由设备 Y 占用，则 X 依赖 Y 先迁出；
 //      无环（DAG）部分按「目标地址最低优先」的可执行顺序逐步输出；
-//   4. 互换或多设备环路（依赖图中的环）按「环内最小旧地址升序」【逐环】解开：
-//      每环先把一台锚点设备迁到其【原网段】内最低的临时可用地址——候选只排除
-//      「选址当时的全部占用」与「全部最终目标地址」；再依次完成环内改址，最后把
-//      该设备从临时地址迁到目标地址并自然释放临时地址。该环完整结束后才开始下一环，
-//      故已释放的临时地址可被后续独立环复用（不会被首环永久预留而误阻断后续环）；
-//      某一环在选址当时没有任何一台设备能在其原网段找到临时地址时，明确阻止该环
-//      （并阻止整个清单、不输出任何部分步骤）；
+//   4. 互换或多设备环路（依赖图中的环）按「环内最小旧地址升序、同址按稳定 ID 决胜」
+//      【逐环】解开：每环先把一台锚点设备迁到其【原网段】内最低的临时可用地址——
+//      锚点候选固定按「旧地址升序、旧地址相同按稳定登记 ID 决胜」排序（次序只取决于
+//      登记与目标数据本身，与 CSV 行顺序无关），取首个能在原网段安排临时地址的设备；
+//      前一候选找不到空位时才依序尝试下一台。候选只排除「选址当时的全部占用」与
+//      「全部最终目标地址」；再依次完成环内改址，最后把该设备从临时地址迁到目标地址
+//      并自然释放临时地址。该环完整结束后才开始下一环，故已释放的临时地址可被后续
+//      独立环复用（不会被首环永久预留而误阻断后续环）；某一环在选址当时没有任何一台
+//      设备能在其原网段找到临时地址时，明确阻止该环（并阻止整个清单、不输出任何部分步骤）；
 //   5. 新建设备（CSV 中的新 MAC）在其目标地址腾空后才能上线；目标地址被不会迁走的
 //      既有设备占住时，作为阻断项明确列出。
 
@@ -252,13 +254,21 @@ export function buildMigrationPlan(
 
   /* ---------- 识别环并按「环内最小旧地址升序」确定逐环处理顺序 ---------- */
   const moverById = new Map(movers.map((d) => [d.id, d]))
+  // 环内锚点候选的固定次序：旧地址升序，旧地址相同再按稳定登记 ID 决胜。
+  // 该次序只取决于登记与目标数据本身，与 CSV 行序无关——比较式必须加括号，
+  // 否则 `差 || id比较 ? -1 : ...` 会被解析成 `(差 || id比较) ? -1 : ...`，
+  // 任意非零旧地址差都恒返回同一方向，候选次序被输入行序带偏。
+  const byFromThenId = (a: DeviceView, b: DeviceView) =>
+    a.from! - b.from! || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)
   const cycleOrder = cycles
     .map((memberIds) => {
       const views = memberIds.map((id) => moverById.get(id)!)
-      const minFrom = Math.min(...views.map((d) => d.from!))
-      return { memberIds, views, minFrom }
+      // 环的次序键：环内最小旧地址 + 该地址设备的稳定 ID（同最小旧地址时决胜，
+      // 保证仅调整 CSV 行顺序不会改变逐环处理次序）
+      const anchorView = [...views].sort(byFromThenId)[0]
+      return { memberIds, views, minFrom: anchorView.from!, minId: anchorView.id }
     })
-    .sort((a, b) => a.minFrom - b.minFrom)
+    .sort((a, b) => a.minFrom - b.minFrom || (a.minId < b.minId ? -1 : a.minId > b.minId ? 1 : 0))
 
   const cycleViews: MigrationCycle[] = []
   function staticBlockedReturn(reason: string): MigrationPlan {
@@ -326,17 +336,17 @@ export function buildMigrationPlan(
 
   /**
    * 选址当时为某一环挑选锚点与临时地址：
-   * 锚点候选为环中原网段可用的设备（按原地址升序、ID 次序）；
-   * 临时地址在该原网段内取最低可用主机地址，仅排除
+   * 锚点候选为环中原网段可用的设备，固定按「旧地址升序、同地址按稳定 ID 决胜」排序
+   * （次序只取决于登记数据本身，与 CSV 行顺序无关）；依次尝试候选，
+   * 前一候选在其原网段找不到任何可用临时地址时才继续尝试下一台。
+   * 临时地址在该候选的原网段内取最低可用主机地址，仅排除
    *   ① 选址当时该网段内的实况占用（此前各环已结束、其临时地址已释放，故可被复用）
    *   ② 全部最终目标地址（临时地址绝不能与任何设备的终态撞址）。
    */
   function chooseTempForCycle(
     views: DeviceView[],
   ): { device: DeviceView; temp: number; tempSeg: AllocSegment } | { triedReasons: string[] } {
-    const candidates = views
-      .filter((d) => d.fromSegment)
-      .sort((a, b) => (a.from! - b.from! || a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
+    const candidates = views.filter((d) => d.fromSegment).sort(byFromThenId)
     const triedReasons: string[] = []
     for (const device of candidates) {
       const seg = device.fromSegment!

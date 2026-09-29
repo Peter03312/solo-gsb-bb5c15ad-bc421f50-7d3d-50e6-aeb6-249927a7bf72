@@ -2886,6 +2886,91 @@ function simulateNoTransientDup(
   check('改到新网段后恢复编排', buildMigrationPlan(importOrThrow(fixedCsv, existing, migratedPlan), existing, migratedPlan).steps.length === 1)
 }
 
+// 23q) 锚点选择与 CSV 行顺序无关：相同登记与目标仅调换 CSV 行序时，
+//  锚点必须固定为旧地址升序、同址按稳定 ID 决胜的首个候选，临时地址与逐步清单完全一致。
+//  （回归：旧比较式 `(a.from-b.from || a.id<b.id ? -1 : ...)` 把任意非零旧地址差都
+//    判成同一方向，行序反转会让锚点从 A 换成 B。）
+{
+  const existing: HostAssignment[] = [
+    { id: 'a', ownerId: 'q3', name: 'A', address: ipToInt('192.168.10.40'), mode: 'manual', mac: 'aa:bb:cc:00:00:01' },
+    { id: 'b', ownerId: 'q3', name: 'B', address: ipToInt('192.168.10.41'), mode: 'manual', mac: 'aa:bb:cc:00:00:02' },
+  ]
+  const header = '网段 CIDR,设备名,IPv4,MAC'
+  const rowA = '192.168.10.32/27,A,192.168.10.41,aa:bb:cc:00:00:01'
+  const rowB = '192.168.10.32/27,B,192.168.10.40,aa:bb:cc:00:00:02'
+  const sigSteps = (mp: ReturnType<typeof buildMigrationPlan>) =>
+    JSON.stringify(mp.steps.map((s) => [s.kind, s.deviceId, s.fromAddress ?? null, s.address]))
+  const mpAb = buildMigrationPlan(importOrThrow([header, rowA, rowB].join('\n'), existing), existing, hostPlan)
+  const mpBa = buildMigrationPlan(importOrThrow([header, rowB, rowA].join('\n'), existing), existing, hostPlan)
+  check('两种行序均可编排（3 步）', mpAb.ok && mpBa.ok && mpAb.steps.length === 3 && mpBa.steps.length === 3)
+  check('行序不影响锚点：恒为旧地址更低的 A（.40），临时地址恒为 .33',
+    mpAb.steps[0].deviceId === 'a' && mpBa.steps[0].deviceId === 'a' &&
+      mpAb.steps[0].address === ipToInt('192.168.10.33') &&
+      mpBa.steps[0].address === ipToInt('192.168.10.33'),
+    `AB序锚点=${mpAb.steps[0]?.deviceId}:${intToIp(mpAb.steps[0]?.address ?? -1)} BA序锚点=${mpBa.steps[0]?.deviceId}:${intToIp(mpBa.steps[0]?.address ?? -1)}`)
+  check('行序不影响逐步清单（操作/设备/原地址/目标逐项一致）', sigSteps(mpAb) === sigSteps(mpBa),
+    `${sigSteps(mpAb)} !== ${sigSteps(mpBa)}`)
+}
+
+// 23q2) 三设备环同样与 CSV 行序无关：倒序录入时锚点仍为旧地址最低的 A
+{
+  const existing: HostAssignment[] = [
+    { id: 'a', ownerId: 'q3', name: 'A', address: ipToInt('192.168.10.40'), mode: 'manual', mac: 'aa:bb:cc:00:00:01' },
+    { id: 'b', ownerId: 'q3', name: 'B', address: ipToInt('192.168.10.41'), mode: 'manual', mac: 'aa:bb:cc:00:00:02' },
+    { id: 'c', ownerId: 'q3', name: 'C', address: ipToInt('192.168.10.42'), mode: 'manual', mac: 'aa:bb:cc:00:00:03' },
+  ]
+  const csv = [
+    '网段 CIDR,设备名,IPv4,MAC',
+    '192.168.10.32/27,C,192.168.10.40,aa:bb:cc:00:00:03',
+    '192.168.10.32/27,B,192.168.10.42,aa:bb:cc:00:00:02',
+    '192.168.10.32/27,A,192.168.10.41,aa:bb:cc:00:00:01',
+  ].join('\n')
+  const mp = buildMigrationPlan(importOrThrow(csv, existing), existing, hostPlan)
+  check('倒序三设备环：锚点恒为 A、临时 .33，4 步可解',
+    mp.ok && mp.steps.length === 4 && mp.steps[0].deviceId === 'a' &&
+      mp.steps[0].address === ipToInt('192.168.10.33'),
+    mp.ok ? mp.steps.map((s) => `${s.deviceId}:${s.kind}`).join(',') : mp.blockers.map((b) => b.message).join('|'))
+  simulateNoTransientDup(mp.steps)
+}
+
+// 23q3) 首个候选无空位时依序尝试下一台：满配 /30 设备 A@.17/B@.18 互换，
+//  A（旧地址更低）的原网段无任何临时地址；C@.33 与 A/B 同环（.33→.18、B .18→.33 不构成，
+//  改用三设备环 A.17→.18、B.18→.33、C.33→.17）：A 的原网段 q4(/30 满配)无空位，
+//  依序尝试 B（原网段 q3 的 /27 有空闲），锚点落 B 而非阻断整份清单。
+{
+  const existing: HostAssignment[] = [
+    { id: 'a', ownerId: 'q4', name: 'A', address: ipToInt('192.168.10.17'), mode: 'manual', mac: 'aa:bb:cc:00:00:01' },
+    { id: 'b', ownerId: 'q3', name: 'B', address: ipToInt('192.168.10.33'), mode: 'manual', mac: 'aa:bb:cc:00:00:02' },
+    { id: 'c', ownerId: 'q4', name: 'C', address: ipToInt('192.168.10.18'), mode: 'manual', mac: 'aa:bb:cc:00:00:03' },
+  ]
+  // A .17→.18（入 q4 原址）、C .18→.33（入 q3）、B .33→.17（入 q4）形成跨段三设备环；
+  // 候选旧地址升序：A(.17, q4) < C(.18, q4) < B(.33, q3)——q4 /30 满配无临时空位，
+  // 前两个候选都失败后由 B 在 q3 /27 取得临时地址 .34（.33 为 C 的目标、.17/.18 为目标且不在同段）。
+  const csv = [
+    '网段 CIDR,设备名,IPv4,MAC',
+    '192.168.10.16/30,A,192.168.10.18,aa:bb:cc:00:00:01',
+    '192.168.10.32/27,C,192.168.10.33,aa:bb:cc:00:00:03',
+    '192.168.10.16/30,B,192.168.10.17,aa:bb:cc:00:00:02',
+  ].join('\n')
+  const mp = buildMigrationPlan(importOrThrow(csv, existing), existing, hostPlan)
+  check('前两个候选原网段满配：依序回退到候选 B，环可解而非阻断',
+    mp.ok && mp.steps.length === 4 && mp.steps[0].kind === 'temp-move' &&
+      mp.steps[0].deviceId === 'b' && mp.steps[0].tempCidr === '192.168.10.32/27',
+    mp.ok ? mp.steps.map((s) => `${s.deviceId}:${s.kind}:${intToIp(s.address)}`).join(',') : mp.blockers.map((x) => x.message).join('|'))
+  simulateNoTransientDup(mp.steps)
+  // CSV 行序打乱后锚点仍回退到 B
+  const csvShuffled = [
+    '网段 CIDR,设备名,IPv4,MAC',
+    '192.168.10.32/27,C,192.168.10.33,aa:bb:cc:00:00:03',
+    '192.168.10.16/30,B,192.168.10.17,aa:bb:cc:00:00:02',
+    '192.168.10.16/30,A,192.168.10.18,aa:bb:cc:00:00:01',
+  ].join('\n')
+  const mp2 = buildMigrationPlan(importOrThrow(csvShuffled, existing), existing, hostPlan)
+  check('行序打乱后回退锚点仍为 B（与行序无关）',
+    mp2.ok && mp2.steps[0].deviceId === 'b' && mp2.steps[0].address === mp.steps[0].address,
+    mp2.ok ? `${mp2.steps[0]?.deviceId}:${intToIp(mp2.steps[0]?.address ?? -1)}` : mp2.blockers.map((x) => x.message).join('|'))
+}
+
 // ========== 24) IPv4 路径分片预演 ==========
 const fragHops = (mtus: Array<number | string>): FragHopInput[] =>
   mtus.map((m, i) => ({ id: `fh${i}`, mtu: String(m) }))
