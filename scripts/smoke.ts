@@ -2542,6 +2542,80 @@ function simulateNoTransientDup(
   simulateNoTransientDup(mp.steps)
 }
 
+// 23e2) 锚点选择对 CSV 行顺序稳定（回归）：旧候选比较式把任意非零旧地址差都判为同向，
+//  相同登记与目标、仅调换 CSV 行顺序就可能换掉锚点与临时地址。
+{
+  const existing: HostAssignment[] = [
+    { id: 'a', ownerId: 'q3', name: 'A', address: ipToInt('192.168.10.40'), mode: 'manual', mac: 'aa:bb:cc:00:00:01' },
+    { id: 'b', ownerId: 'q3', name: 'B', address: ipToInt('192.168.10.41'), mode: 'manual', mac: 'aa:bb:cc:00:00:02' },
+    { id: 'c', ownerId: 'q3', name: 'C', address: ipToInt('192.168.10.42'), mode: 'manual', mac: 'aa:bb:cc:00:00:03' },
+  ]
+  const header = '网段 CIDR,设备名,IPv4,MAC'
+  const rows = [
+    '192.168.10.32/27,A,192.168.10.41,aa:bb:cc:00:00:01',
+    '192.168.10.32/27,B,192.168.10.42,aa:bb:cc:00:00:02',
+    '192.168.10.32/27,C,192.168.10.40,aa:bb:cc:00:00:03',
+  ]
+  const plans = [
+    buildMigrationPlan(importOrThrow([header, ...rows].join('\n'), existing), existing, hostPlan),
+    buildMigrationPlan(importOrThrow([header, ...[...rows].reverse()].join('\n'), existing), existing, hostPlan),
+  ]
+  for (const [i, mp] of plans.entries()) {
+    check(`CSV 行序${i === 0 ? '正序' : '逆序'}：三环可解、4 步`, mp.ok && mp.steps.length === 4,
+      mp.ok ? mp.steps.map((s) => s.kind).join(',') : mp.blockers.map((x) => x.message).join('|'))
+  }
+  const sig = (mp: ReturnType<typeof buildMigrationPlan>) =>
+    JSON.stringify(mp.steps.map((s) => [s.deviceId, s.kind, intToIp(s.fromAddress ?? -1), intToIp(s.address)]))
+  check('两种 CSV 行序下步骤（含锚点与临时地址）完全一致：锚点恒为旧地址最低的 A、临时地址恒为 .33',
+    sig(plans[0]) === sig(plans[1]) &&
+      plans[0].steps[0].deviceId === 'a' && plans[0].steps[0].address === ipToInt('192.168.10.33'),
+    `${sig(plans[0])} !== ${sig(plans[1])}`)
+  check('两种行序下环摘要锚点一致',
+    plans[0].cycles[0].pivotId === 'a' && plans[1].cycles[0].pivotId === 'a' &&
+      plans[0].cycles[0].tempAddress === plans[1].cycles[0].tempAddress)
+  simulateNoTransientDup(plans[1].steps)
+}
+
+// 23e3) 前一锚点候选原网段无空位时，依序尝试下一台（回归）：
+//  /29（可用 .1~.6）中三台设备 A@.1、B@.2、C@.3 形成三设备环，.4~.6 被三台不迁设备守满。
+//  三者旧地址同在该 /29，看似都无空位——但 C 的【原网段】归属判断只看地址范围，
+//  这里三机同段无法区分，故另造跨段场景：A/B 原网段为满配 /30（唯一两个可用地址都是
+//  环成员原址且同为最终目标，无临时空位），C 原网段为有空位的 32/27，锚点必须回退到 C。
+{
+  const p30 = plan({
+    parentCidr: '10.6.0.0/30',
+    reservations: [],
+    requirements: [{ id: 's30', name: '满/30段', hosts: 2, cidr: '10.6.0.0/30' }],
+  })
+  check('前置：/30 规划成功', p30.inputErrors.length === 0 && p30.segments.some((s) => s.cidr === '10.6.0.0/30'))
+  // 合并两个独立规划的网段（地址空间不相交：10.6.0.0/30 与 192.168.10.0/24）
+  const mergedPlan: typeof hostPlan = {
+    ...p30,
+    segments: [...p30.segments, ...hostPlan.segments],
+  }
+  // 三设备环：A@10.6.0.1 -> 10.6.0.2（B 占）；B@10.6.0.2 -> .40（C 占）；C@.40 -> 10.6.0.1（A 占）
+  const existing3: HostAssignment[] = [
+    { id: 'a', ownerId: 's30', name: 'A', address: ipToInt('10.6.0.1'), mode: 'manual', mac: 'aa:bb:cc:00:00:01' },
+    { id: 'b', ownerId: 's30', name: 'B', address: ipToInt('10.6.0.2'), mode: 'manual', mac: 'aa:bb:cc:00:00:02' },
+    { id: 'c', ownerId: 'q3', name: 'C', address: ipToInt('192.168.10.40'), mode: 'manual', mac: 'aa:bb:cc:00:00:03' },
+  ]
+  const csv = [
+    '网段 CIDR,设备名,IPv4,MAC',
+    '10.6.0.0/30,A,10.6.0.2,aa:bb:cc:00:00:01',
+    '192.168.10.32/27,B,192.168.10.40,aa:bb:cc:00:00:02',
+    '10.6.0.0/30,C,10.6.0.1,aa:bb:cc:00:00:03',
+  ].join('\n')
+  const mp = buildMigrationPlan(importOrThrow(csv, existing3, mergedPlan), existing3, mergedPlan)
+  check('A/B 的 /30 原网段无临时空位、回退到 C 的 32/27：环仍可解（4 步）',
+    mp.ok && mp.counts.cycles === 1 && mp.steps.length === 4,
+    mp.ok ? mp.steps.map((s) => [s.deviceId, s.kind]).join(',') : mp.blockers.map((x) => x.message).join('|'))
+  check('锚点回退为 C，临时地址为其原网段 32/27 最低空闲 .33',
+    mp.steps[0].deviceId === 'c' && mp.steps[0].address === ipToInt('192.168.10.33') &&
+      mp.steps[0].tempCidr === '192.168.10.32/27' && mp.cycles[0].pivotId === 'c',
+    mp.steps.map((s) => [s.deviceId, s.kind, intToIp(s.address)]).join('|'))
+  simulateNoTransientDup(mp.steps)
+}
+
 // 23f) 新建设备上线：目标空闲即一步 add；目标被将迁走设备占用则排在其后
 {
   const existing: HostAssignment[] = [
