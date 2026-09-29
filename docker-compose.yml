@@ -1,0 +1,10 @@
+services:
+  vlsm-planner:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: vlsm-planner:latest
+    container_name: vlsm-planner
+    ports:
+      - "8080:80"
+    restart: unless-stopped
